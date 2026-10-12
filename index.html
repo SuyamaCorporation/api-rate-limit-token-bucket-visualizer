@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>API Rate Limit Visualizer</title>
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen p-4">
+<div class="max-w-3xl mx-auto">
+  <h1 class="text-2xl font-bold mb-2 text-purple-400">API Rate Limit Visualizer</h1>
+
+  <!-- Tabs -->
+  <div class="flex gap-1 mb-5" role="tablist">
+    <button role="tab" aria-selected="true" data-tab="token"
+      class="tab-btn bg-purple-700 text-white px-4 py-2 rounded-t-lg font-semibold text-sm">Token Bucket</button>
+    <button role="tab" aria-selected="false" data-tab="leaky"
+      class="tab-btn bg-gray-700 hover:bg-gray-600 text-gray-300 px-4 py-2 rounded-t-lg font-semibold text-sm">Leaky Bucket</button>
+    <button role="tab" aria-selected="false" data-tab="window"
+      class="tab-btn bg-gray-700 hover:bg-gray-600 text-gray-300 px-4 py-2 rounded-t-lg font-semibold text-sm">Fixed Window</button>
+  </div>
+
+  <div class="bg-gray-800 rounded-b-xl rounded-tr-xl p-5">
+    <!-- Description -->
+    <p id="tabDesc" class="text-sm text-gray-400 mb-4"></p>
+
+    <!-- Controls -->
+    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-5">
+      <div>
+        <label for="sliderRefill" class="block text-xs font-semibold text-gray-300 mb-1">
+          <span id="refillLabel">Refill Rate (tokens/s)</span>: <span id="refillVal">5</span>
+        </label>
+        <input id="sliderRefill" type="range" min="1" max="20" value="5"
+          class="w-full accent-purple-500" aria-label="Refill rate">
+      </div>
+      <div>
+        <label for="sliderCap" class="block text-xs font-semibold text-gray-300 mb-1">
+          Capacity: <span id="capVal">20</span>
+        </label>
+        <input id="sliderCap" type="range" min="5" max="50" value="20"
+          class="w-full accent-purple-500" aria-label="Bucket capacity">
+      </div>
+      <div>
+        <label for="sliderReq" class="block text-xs font-semibold text-gray-300 mb-1">
+          Request Rate (req/s): <span id="reqVal">8</span>
+        </label>
+        <input id="sliderReq" type="range" min="1" max="25" value="8"
+          class="w-full accent-purple-500" aria-label="Request rate">
+      </div>
+    </div>
+
+    <div class="flex gap-3 mb-5">
+      <button id="startBtn" class="bg-green-600 hover:bg-green-500 px-4 py-2 rounded font-semibold text-sm transition-colors">▶ Start</button>
+      <button id="resetBtn" class="bg-gray-600 hover:bg-gray-500 px-4 py-2 rounded font-semibold text-sm transition-colors">↺ Reset</button>
+    </div>
+
+    <!-- Canvas + Stats -->
+    <div class="flex flex-col sm:flex-row gap-5 items-start">
+      <canvas id="bucketCanvas" width="200" height="200"
+        aria-label="Bucket fill level" role="img"
+        class="rounded-xl bg-gray-900 flex-shrink-0"></canvas>
+      <div class="flex-1 w-full">
+        <canvas id="histCanvas" width="380" height="200"
+          aria-label="Request history" role="img"
+          class="w-full rounded-xl bg-gray-900 mb-3"></canvas>
+        <div class="grid grid-cols-2 gap-3">
+          <div class="bg-green-900 rounded-lg p-3 text-center">
+            <div class="text-xs text-green-300 mb-1">Accepted</div>
+            <div id="acceptedCount" class="text-2xl font-bold text-green-400">0</div>
+          </div>
+          <div class="bg-red-900 rounded-lg p-3 text-center">
+            <div class="text-xs text-red-300 mb-1">Rejected</div>
+            <div id="rejectedCount" class="text-2xl font-bold text-red-400">0</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const tabs = document.querySelectorAll('.tab-btn');
+const tabDesc = document.getElementById('tabDesc');
+const sliderRefill = document.getElementById('sliderRefill');
+const sliderCap = document.getElementById('sliderCap');
+const sliderReq = document.getElementById('sliderReq');
+const refillVal = document.getElementById('refillVal');
+const capVal = document.getElementById('capVal');
+const reqVal = document.getElementById('reqVal');
+const refillLabel = document.getElementById('refillLabel');
+const startBtn = document.getElementById('startBtn');
+const resetBtn = document.getElementById('resetBtn');
+const acceptedCount = document.getElementById('acceptedCount');
+const rejectedCount = document.getElementById('rejectedCount');
+const bucketCanvas = document.getElementById('bucketCanvas');
+const bctx = bucketCanvas.getContext('2d');
+const histCanvas = document.getElementById('histCanvas');
+const hctx = histCanvas.getContext('2d');
+
+const descriptions = {
+  token: 'Token Bucket: tokens refill at a steady rate up to max capacity. Each request consumes 1 token; if the bucket is empty the request is rejected.',
+  leaky: 'Leaky Bucket: requests enter a queue and are served at a constant drain rate. Incoming requests exceeding the bucket size are rejected.',
+  window: 'Fixed Window: a counter resets every window period. Requests within the window are accepted up to the limit; the rest are rejected.'
+};
+
+let currentTab = 'token';
+let running = false;
+let rafId = null;
+let tokens = 20;
+let accepted = 0;
+let rejected = 0;
+let history = []; // {t, accepted}
+let lastRefill = null;
+let lastReq = null;
+let windowCount = 0;
+let windowStart = null;
+
+function getRefill() { return parseInt(sliderRefill.value); }
+function getCap() { return parseInt(sliderCap.value); }
+function getReqRate() { return parseInt(sliderReq.value); }
+
+tabs.forEach(btn => {
+  btn.addEventListener('click', () => {
+    tabs.forEach(b => {
+      b.classList.remove('bg-purple-700', 'text-white');
+      b.classList.add('bg-gray-700', 'text-gray-300');
+      b.setAttribute('aria-selected', 'false');
+    });
+    btn.classList.add('bg-purple-700', 'text-white');
+    btn.classList.remove('bg-gray-700', 'text-gray-300');
+    btn.setAttribute('aria-selected', 'true');
+    currentTab = btn.dataset.tab;
+    tabDesc.textContent = descriptions[currentTab];
+    doReset();
+    updateRefillLabel();
+  });
+});
+tabDesc.textContent = descriptions.token;
+
+function updateRefillLabel() {
+  if (currentTab === 'leaky') refillLabel.textContent = 'Drain Rate (req/s)';
+  else if (currentTab === 'window') refillLabel.textContent = 'Window Size (req)';
+  else refillLabel.textContent = 'Refill Rate (tokens/s)';
+}
+
+[sliderRefill, sliderCap, sliderReq].forEach(s => s.addEventListener('input', () => {
+  refillVal.textContent = sliderRefill.value;
+  capVal.textContent = sliderCap.value;
+  reqVal.textContent = sliderReq.value;
+}));
+
+function doReset() {
+  if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+  running = false;
+  startBtn.textContent = '▶ Start';
+  tokens = getCap();
+  accepted = 0; rejected = 0;
+  history = [];
+  lastRefill = null; lastReq = null;
+  windowCount = 0; windowStart = null;
+  acceptedCount.textContent = '0';
+  rejectedCount.textContent = '0';
+  drawBucket(1);
+  drawHistory();
+}
+
+startBtn.addEventListener('click', () => {
+  if (!running) {
+    running = true;
+    startBtn.textContent = '⏸ Pause';
+    lastRefill = performance.now();
+    lastReq = performance.now();
+    if (currentTab === 'window') windowStart = performance.now();
+    loop(performance.now());
+  } else {
+    running = false;
+    startBtn.textContent = '▶ Start';
+    if (rafId) cancelAnimationFrame(rafId);
+  }
+});
+resetBtn.addEventListener('click', doReset);
+
+function loop(now) {
+  const refillRate = getRefill();
+  const cap = getCap();
+  const reqRate = getReqRate();
+
+  if (currentTab === 'token') {
+    const dt = (now - lastRefill) / 1000;
+    tokens = Math.min(cap, tokens + refillRate * dt);
+    lastRefill = now;
+
+    const dtReq = (now - lastReq) / 1000;
+    const reqsThisCycle = Math.floor(dtReq * reqRate);
+    if (reqsThisCycle >= 1) {
+      lastReq = now;
+      if (tokens >= 1) { tokens -= 1; accepted++; history.push(1); }
+      else { rejected++; history.push(0); }
+    }
+  } else if (currentTab === 'leaky') {
+    // Drain = refillRate  (serve from queue)
+    const dtReq = (now - lastReq) / 1000;
+    const reqsThisCycle = Math.floor(dtReq * reqRate);
+    if (reqsThisCycle >= 1) {
+      lastReq = now;
+      // queue = tokens level (requests waiting)
+      if (tokens < cap) { tokens = Math.min(cap, tokens + 1); accepted++; history.push(1); }
+      else { rejected++; history.push(0); }
+    }
+    // drain the queue
+    const dtDrain = (now - lastRefill) / 1000;
+    tokens = Math.max(0, tokens - refillRate * dtDrain);
+    lastRefill = now;
+  } else {
+    // Fixed window
+    const windowSize = 1000 / refillRate; // ms per window
+    if (now - windowStart >= windowSize) {
+      windowStart = now;
+      windowCount = 0;
+    }
+    const dtReq = (now - lastReq) / 1000;
+    const reqsThisCycle = Math.floor(dtReq * reqRate);
+    if (reqsThisCycle >= 1) {
+      lastReq = now;
+      if (windowCount < cap) { windowCount++; tokens = windowCount / cap; accepted++; history.push(1); }
+      else { rejected++; history.push(0); }
+    }
+    tokens = 1 - (windowCount / cap);
+  }
+
+  if (history.length > 80) history = history.slice(-80);
+  acceptedCount.textContent = accepted;
+  rejectedCount.textContent = rejected;
+  drawBucket(currentTab === 'token' ? tokens / cap : currentTab === 'leaky' ? 1 - tokens / cap : tokens);
+  drawHistory();
+
+  if (running) rafId = requestAnimationFrame(loop);
+}
+
+function drawBucket(fillFraction) {
+  const W = bucketCanvas.width, H = bucketCanvas.height;
+  bctx.clearRect(0, 0, W, H);
+  bctx.fillStyle = '#111827';
+  bctx.fillRect(0, 0, W, H);
+
+  const cx = W / 2, cy = H / 2, r = 80;
+  // Background circle
+  bctx.beginPath();
+  bctx.arc(cx, cy, r, 0, Math.PI * 2);
+  bctx.fillStyle = '#1f2937';
+  bctx.fill();
+  bctx.strokeStyle = '#4b5563';
+  bctx.lineWidth = 3;
+  bctx.stroke();
+
+  // Fill arc
+  const f = Math.max(0, Math.min(1, fillFraction));
+  const startAngle = -Math.PI / 2;
+  const endAngle = startAngle + f * Math.PI * 2;
+  if (f > 0) {
+    bctx.beginPath();
+    bctx.moveTo(cx, cy);
+    bctx.arc(cx, cy, r - 2, startAngle, endAngle);
+    bctx.closePath();
+    const grad = bctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+    grad.addColorStop(0, f > 0.5 ? '#7c3aed' : f > 0.2 ? '#d97706' : '#dc2626');
+    grad.addColorStop(1, f > 0.5 ? '#4c1d95' : f > 0.2 ? '#92400e' : '#7f1d1d');
+    bctx.fillStyle = grad;
+    bctx.fill();
+  }
+
+  // Label
+  bctx.fillStyle = '#f9fafb';
+  bctx.font = 'bold 22px sans-serif';
+  bctx.textAlign = 'center';
+  bctx.textBaseline = 'middle';
+  bctx.fillText(Math.round(f * 100) + '%', cx, cy);
+  bctx.font = '11px sans-serif';
+  bctx.fillStyle = '#9ca3af';
+  bctx.fillText('Fill Level', cx, cy + 22);
+}
+
+function drawHistory() {
+  const W = histCanvas.width, H = histCanvas.height;
+  hctx.clearRect(0, 0, W, H);
+  hctx.fillStyle = '#111827';
+  hctx.fillRect(0, 0, W, H);
+
+  const barW = W / 80;
+  history.forEach((v, i) => {
+    hctx.fillStyle = v ? '#22c55e' : '#ef4444';
+    hctx.fillRect(i * barW, 0, barW - 1, H);
+  });
+
+  hctx.fillStyle = '#9ca3af';
+  hctx.font = '10px sans-serif';
+  hctx.textAlign = 'left';
+  hctx.fillText('← Recent requests (green=accepted, red=rejected)', 4, H - 4);
+}
+
+doReset();
+</script>
+</body>
+</html>
